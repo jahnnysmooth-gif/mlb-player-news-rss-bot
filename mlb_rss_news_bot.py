@@ -105,14 +105,6 @@ TRANSACTION_WORDS = [
     "traded", "signed", "dfa", "released", "activated", "reinstated", "acquired"
 ]
 
-TEAM_WORDS = {
-    "diamondbacks", "braves", "orioles", "red sox", "cubs", "white sox", "reds",
-    "guardians", "rockies", "tigers", "astros", "royals", "angels", "dodgers",
-    "marlins", "brewers", "twins", "mets", "yankees", "athletics", "a's",
-    "phillies", "pirates", "padres", "giants", "mariners", "cardinals", "rays",
-    "rangers", "blue jays", "nationals"
-}
-
 
 def get_redis():
     if not REDIS_URL:
@@ -215,13 +207,20 @@ def parse_fantasypros_date(text):
     if not text:
         return None
 
-    cleaned = re.sub(r"(\d)(st|nd|rd|th)\b", r"\1", text)
-    cleaned = re.sub(r"\s+(EDT|EST)\b", "", cleaned)
+    match = re.match(
+        r"^(?P<dow>[A-Z][a-z]{2}),\s+(?P<mon>[A-Z][a-z]{2})\s+(?P<day>\d{1,2})(?:st|nd|rd|th)\s+(?P<time>\d{1,2}:\d{2}(?:am|pm))\s+(?P<tz>EDT|EST)$",
+        text,
+    )
+    if not match:
+        return None
 
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    year = now_et.year
+
+    rebuilt = f"{match.group('dow')}, {match.group('mon')} {match.group('day')} {year} {match.group('time')}"
     try:
-        naive = datetime.strptime(cleaned, "%a, %b %d %I:%M%p")
-        now_et = datetime.now(ZoneInfo("America/New_York"))
-        dt_et = naive.replace(year=now_et.year, tzinfo=ZoneInfo("America/New_York"))
+        naive = datetime.strptime(rebuilt, "%a, %b %d %Y %I:%M%p")
+        dt_et = naive.replace(tzinfo=ZoneInfo("America/New_York"))
         return dt_et.astimezone(UTC)
     except Exception:
         return None
@@ -343,7 +342,7 @@ def fetch_fantasypros_feed(source):
 
     page_text = soup.get_text("\n")
     start_marker = "Latest Player Updates"
-    end_marker = "Footer"
+    end_marker = "Premium"
 
     start_idx = page_text.find(start_marker)
     if start_idx == -1:
@@ -378,21 +377,23 @@ def fetch_fantasypros_feed(source):
         source_blurb = ""
         fantasy_impact = ""
 
-        if i + 2 < len(lines) and lines[i + 1].startswith("By "):
+        if i + 1 < len(lines) and lines[i + 1].startswith("By "):
             if i + 2 < len(lines):
                 source_blurb = lines[i + 2]
 
-        for j in range(i + 2, min(i + 8, len(lines))):
+        for j in range(i + 2, min(i + 9, len(lines))):
             if lines[j].startswith("Fantasy Impact:"):
                 fantasy_impact = lines[j].replace("Fantasy Impact:", "", 1).strip()
                 break
             if lines[j].startswith("Category:"):
                 break
 
-        summary_parts = [source_blurb]
+        summary_parts = []
+        if source_blurb:
+            summary_parts.append(source_blurb)
         if fantasy_impact:
             summary_parts.append(f"Fantasy Impact: {fantasy_impact}")
-        summary = normalize(" ".join(x for x in summary_parts if x))
+        summary = normalize(" ".join(summary_parts))
 
         link = canonical_link(title_to_link.get(title, source["url"]))
 
@@ -449,8 +450,13 @@ def is_valid_item(item):
         return True, player
 
     if source_key == "fantasypros":
-        if len(summary) < 20:
-            return False, None
+        # Much looser now: if there is a player name and either a summary
+        # or a news-like title, let it through.
+        combined = f"{title} {summary}"
+        if len(summary) >= 10:
+            return True, player
+        if contains_keyword(combined):
+            return True, player
         return True, player
 
     combined = f"{title} {summary}"
