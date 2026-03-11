@@ -1,0 +1,15 @@
+services:
+  - type: cron
+    name: mlb-player-news-rss-bot
+    runtime: python
+    plan: starter
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python mlb_rss_news_bot.py"
+    schedule: "*/5 * * * *"
+    envVars:
+      - key: DISCORD_WEBHOOK_URL
+        sync: false
+      - key: MAX_POSTS_PER_RUN
+        value: "10"
+      - key: HTTP_TIMEOUT
+        value: "20"
