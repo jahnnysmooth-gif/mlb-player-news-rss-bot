@@ -4,11 +4,13 @@ import time
 import html
 import hashlib
 from datetime import datetime, UTC, timedelta
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlparse, urlunparse, urljoin
+from zoneinfo import ZoneInfo
 
 import feedparser
 import requests
 import redis
+from bs4 import BeautifulSoup
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 REDIS_URL = os.getenv("REDIS_URL", "")
@@ -17,22 +19,30 @@ HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "20"))
 MAX_NEWS_AGE_HOURS = int(os.getenv("MAX_NEWS_AGE_HOURS", "24"))
 DEDUP_TTL_DAYS = int(os.getenv("DEDUP_TTL_DAYS", "14"))
 
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+)
+
 FEEDS = [
     {
         "name": "RotoWire",
         "key": "rotowire",
+        "type": "rss",
         "url": "https://www.rotowire.com/rss/news.php?sport=MLB",
         "priority": 1,
     },
     {
         "name": "FantasyPros",
         "key": "fantasypros",
-        "url": "https://www.fantasypros.com/mlb/player-news.php?format=rss",
+        "type": "html",
+        "url": "https://www.fantasypros.com/mlb/player-news.php",
         "priority": 2,
     },
     {
         "name": "MLB Trade Rumors Transactions",
         "key": "mlbtr_transactions",
+        "type": "rss",
         "url": "https://www.mlbtraderumors.com/transactions/feed",
         "priority": 3,
     },
@@ -66,6 +76,7 @@ PLAYER_NEWS_KEYWORDS = [
     "acquired",
     "closer",
     "save chance",
+    "bullpen",
 ]
 
 ARTICLE_PATTERNS = [
@@ -190,7 +201,7 @@ def color_for_tag(tag):
     }.get(tag, 0x95A5A6)
 
 
-def parse_date(entry):
+def parse_rss_date(entry):
     if hasattr(entry, "published_parsed") and entry.published_parsed:
         return datetime(*entry.published_parsed[:6], tzinfo=UTC)
     if hasattr(entry, "updated_parsed") and entry.updated_parsed:
@@ -198,9 +209,27 @@ def parse_date(entry):
     return None
 
 
+def parse_fantasypros_date(text):
+    # Example: Wed, Mar 11th 1:01pm EDT
+    text = normalize(text)
+    if not text:
+        return None
+
+    cleaned = re.sub(r"(\d)(st|nd|rd|th)\b", r"\1", text)
+    cleaned = re.sub(r"\s+(EDT|EST)\b", "", cleaned)
+
+    try:
+        naive = datetime.strptime(cleaned, "%a, %b %d %I:%M%p")
+        now_et = datetime.now(ZoneInfo("America/New_York"))
+        dt_et = naive.replace(year=now_et.year, tzinfo=ZoneInfo("America/New_York"))
+        return dt_et.astimezone(UTC)
+    except Exception:
+        return None
+
+
 def is_recent(dt):
     if not dt:
-        return True
+        return False
     return datetime.now(UTC) - dt < timedelta(hours=MAX_NEWS_AGE_HOURS)
 
 
@@ -270,12 +299,12 @@ def looks_like_article(title, summary):
     return False
 
 
-def fetch_feed(source):
+def fetch_rss_feed(source):
     parsed = feedparser.parse(source["url"])
     items = []
 
     for entry in parsed.entries[:25]:
-        published = parse_date(entry)
+        published = parse_rss_date(entry)
         if not is_recent(published):
             continue
 
@@ -294,6 +323,98 @@ def fetch_feed(source):
         })
 
     return items
+
+
+def fetch_fantasypros_feed(source):
+    response = requests.get(
+        source["url"],
+        timeout=HTTP_TIMEOUT,
+        headers={"User-Agent": USER_AGENT},
+    )
+    response.raise_for_status()
+
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    title_to_link = {}
+    for a in soup.find_all("a", href=True):
+        txt = normalize(a.get_text(" ", strip=True))
+        if txt:
+            title_to_link[txt] = urljoin(source["url"], a["href"])
+
+    page_text = soup.get_text("\n")
+    start_marker = "Latest Player Updates"
+    end_marker = "Footer"
+
+    start_idx = page_text.find(start_marker)
+    if start_idx == -1:
+        return []
+
+    page_text = page_text[start_idx:]
+    end_idx = page_text.find(end_marker)
+    if end_idx != -1:
+        page_text = page_text[:end_idx]
+
+    raw_lines = [normalize(x) for x in page_text.splitlines()]
+    lines = [x for x in raw_lines if x]
+
+    items = []
+    date_re = re.compile(r"^[A-Z][a-z]{2},\s+[A-Z][a-z]{2}\s+\d{1,2}(?:st|nd|rd|th)\s+\d{1,2}:\d{2}(?:am|pm)\s+(?:EDT|EST)$")
+
+    for i, line in enumerate(lines):
+        if not date_re.match(line):
+            continue
+
+        if i < 1:
+            continue
+
+        title = lines[i - 1]
+        if title in {"» Rankings", "» Stats", "» More News", "Latest Player Updates", "Menu"}:
+            continue
+
+        published = parse_fantasypros_date(line)
+        if not is_recent(published):
+            continue
+
+        source_blurb = ""
+        fantasy_impact = ""
+
+        if i + 2 < len(lines) and lines[i + 1].startswith("By "):
+            if i + 2 < len(lines):
+                source_blurb = lines[i + 2]
+
+        for j in range(i + 2, min(i + 8, len(lines))):
+            if lines[j].startswith("Fantasy Impact:"):
+                fantasy_impact = lines[j].replace("Fantasy Impact:", "", 1).strip()
+                break
+            if lines[j].startswith("Category:"):
+                break
+
+        summary_parts = [source_blurb]
+        if fantasy_impact:
+            summary_parts.append(f"Fantasy Impact: {fantasy_impact}")
+        summary = normalize(" ".join(x for x in summary_parts if x))
+
+        link = canonical_link(title_to_link.get(title, source["url"]))
+
+        items.append({
+            "title": title,
+            "summary": summary,
+            "link": link,
+            "source_name": source["name"],
+            "source_key": source["key"],
+            "priority": source["priority"],
+            "published": published,
+        })
+
+    return items
+
+
+def fetch_feed(source):
+    if source["type"] == "rss":
+        return fetch_rss_feed(source)
+    if source["type"] == "html":
+        return fetch_fantasypros_feed(source)
+    return []
 
 
 def is_valid_item(item):
@@ -328,7 +449,7 @@ def is_valid_item(item):
         return True, player
 
     if source_key == "fantasypros":
-        if len(summary) < 25:
+        if len(summary) < 20:
             return False, None
         return True, player
 
@@ -418,9 +539,12 @@ def main():
     raw_items = []
 
     for source in FEEDS:
-        items = fetch_feed(source)
-        raw_items.extend(items)
-        print(f"{source['name']}: fetched {len(items)} items")
+        try:
+            items = fetch_feed(source)
+            raw_items.extend(items)
+            print(f"{source['name']}: fetched {len(items)} items")
+        except Exception as exc:
+            print(f"{source['name']} failed: {exc}")
 
     valid = choose_items(raw_items)
 
