@@ -4,17 +4,15 @@ import time
 import html
 import hashlib
 from datetime import datetime, UTC, timedelta
-from urllib.parse import urlparse, urlunparse, urljoin
-from zoneinfo import ZoneInfo
+from urllib.parse import urlparse, urlunparse
 
 import feedparser
 import requests
 import redis
-from bs4 import BeautifulSoup
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 REDIS_URL = os.getenv("REDIS_URL", "")
-MAX_POSTS_PER_RUN = 8
+MAX_POSTS_PER_RUN = 4
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "20"))
 MAX_NEWS_AGE_HOURS = int(os.getenv("MAX_NEWS_AGE_HOURS", "24"))
 DEDUP_TTL_DAYS = int(os.getenv("DEDUP_TTL_DAYS", "14"))
@@ -39,28 +37,17 @@ FEEDS = [
         "priority": 1,
     },
     {
-        "name": "FantasyPros",
-        "key": "fantasypros",
-        "type": "html",
-        "url": "https://www.fantasypros.com/mlb/player-news.php",
-        "priority": 2,
-    },
-    {
         "name": "MLB Trade Rumors Transactions",
         "key": "mlbtr_transactions",
         "type": "rss",
         "url": "https://www.mlbtraderumors.com/transactions/feed",
-        "priority": 3,
+        "priority": 2,
     },
 ]
 
 
-def extract_team(text):
-    t = text.upper()
-    for abbr in TEAM_ABBR:
-        if f" {abbr} " in f" {t} ":
-            return abbr
-    return None
+def get_redis():
+    return redis.from_url(REDIS_URL, decode_responses=True)
 
 
 def normalize(text):
@@ -74,22 +61,57 @@ def strip_html(text):
     return normalize(text)
 
 
-def extract_player(text):
+def canonical_link(link):
+
+    link = normalize(link)
+
+    if not link:
+        return ""
+
+    parsed = urlparse(link)
+    cleaned = parsed._replace(query="", fragment="")
+
+    return urlunparse(cleaned)
+
+
+def truncate(text, limit):
+
     text = normalize(text)
 
-    patterns = [
-        r"\b([A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+(?:Jr\.|Sr\.|II|III))?)\b",
-    ]
+    if len(text) <= limit:
+        return text
 
-    for pattern in patterns:
-        m = re.search(pattern, text)
-        if m:
-            return normalize(m.group(1))
+    return text[: limit - 1].rstrip() + "…"
+
+
+def extract_player(text):
+
+    text = normalize(text)
+
+    pattern = r"\b([A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+(?:Jr\.|Sr\.|II|III))?)\b"
+
+    m = re.search(pattern, text)
+
+    if m:
+        return normalize(m.group(1))
+
+    return None
+
+
+def extract_team(text):
+
+    t = text.upper()
+
+    for abbr in TEAM_ABBR:
+
+        if f" {abbr} " in f" {t} ":
+            return abbr
 
     return None
 
 
 def classify_news(text):
+
     t = text.lower()
 
     if "injur" in t or "il" in t:
@@ -111,6 +133,7 @@ def classify_news(text):
 
 
 def color_for_tag(tag):
+
     return {
         "Injury": 0xE74C3C,
         "Lineup": 0x3498DB,
@@ -122,6 +145,7 @@ def color_for_tag(tag):
 
 
 def parse_rss_date(entry):
+
     if hasattr(entry, "published_parsed") and entry.published_parsed:
         return datetime(*entry.published_parsed[:6], tzinfo=UTC)
 
@@ -132,32 +156,24 @@ def parse_rss_date(entry):
 
 
 def is_recent(dt):
+
     if not dt:
         return False
 
     return datetime.now(UTC) - dt < timedelta(hours=MAX_NEWS_AGE_HOURS)
 
 
-def canonical_link(link):
-    link = normalize(link)
-
-    if not link:
-        return ""
-
-    parsed = urlparse(link)
-    cleaned = parsed._replace(query="", fragment="")
-
-    return urlunparse(cleaned)
-
-
 def dedupe_key(item):
+
     raw = f"{item['source_key']}||{item['title']}||{item['summary']}"
+
     digest = hashlib.sha256(raw.encode()).hexdigest()
 
     return f"mlb-news:{digest}"
 
 
 def fetch_rss_feed(source):
+
     parsed = feedparser.parse(source["url"])
 
     items = []
@@ -186,51 +202,9 @@ def fetch_rss_feed(source):
     return items
 
 
-def fetch_fantasypros_feed(source):
-
-    response = requests.get(
-        source["url"],
-        timeout=HTTP_TIMEOUT,
-        headers={"User-Agent": USER_AGENT},
-    )
-
-    soup = BeautifulSoup(response.text, "html.parser")
-
-    page_text = soup.get_text("\n")
-
-    items = []
-
-    for block in page_text.split("\n\n"):
-
-        title = normalize(block.split("\n")[0])
-
-        if not title:
-            continue
-
-        summary = normalize(block)
-
-        items.append({
-            "title": title,
-            "summary": summary,
-            "link": source["url"],
-            "source_name": source["name"],
-            "source_key": source["key"],
-            "priority": source["priority"],
-            "published": datetime.now(UTC),
-        })
-
-    return items
-
-
 def fetch_feed(source):
 
-    if source["type"] == "rss":
-        return fetch_rss_feed(source)
-
-    if source["type"] == "html":
-        return fetch_fantasypros_feed(source)
-
-    return []
+    return fetch_rss_feed(source)
 
 
 def post_to_discord(item):
@@ -247,7 +221,10 @@ def post_to_discord(item):
     else:
         header = f"{emoji} Player News"
 
-    details = item["summary"][:420]
+    details = truncate(item["summary"], 420)
+
+    if not details:
+        details = "No additional details."
 
     payload = {
         "embeds": [
@@ -266,16 +243,30 @@ def post_to_discord(item):
         ]
     }
 
-    r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=HTTP_TIMEOUT)
+    for _ in range(5):
 
-    if r.status_code >= 300:
+        r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=HTTP_TIMEOUT)
+
+        if r.status_code < 300:
+            time.sleep(1.6)
+            return
+
+        if r.status_code == 429:
+
+            retry = 5
+
+            try:
+                retry = float(r.json().get("retry_after", 5))
+            except Exception:
+                pass
+
+            print(f"Rate limited. Sleeping {retry}")
+
+            time.sleep(retry + 0.5)
+
+            continue
+
         r.raise_for_status()
-
-    time.sleep(1.5)
-
-
-def get_redis():
-    return redis.from_url(REDIS_URL, decode_responses=True)
 
 
 def main():
@@ -287,6 +278,7 @@ def main():
     for source in FEEDS:
 
         try:
+
             items = fetch_feed(source)
 
             raw_items.extend(items)
@@ -294,6 +286,7 @@ def main():
             print(f"{source['name']}: fetched {len(items)} items")
 
         except Exception as exc:
+
             print(f"{source['name']} failed: {exc}")
 
     posted = 0
