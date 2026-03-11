@@ -32,16 +32,12 @@ FEEDS = [
     {
         "name": "RotoWire",
         "key": "rotowire",
-        "type": "rss",
         "url": "https://www.rotowire.com/rss/news.php?sport=MLB",
-        "priority": 1,
     },
     {
         "name": "MLB Trade Rumors Transactions",
-        "key": "mlbtr_transactions",
-        "type": "rss",
+        "key": "mlbtr",
         "url": "https://www.mlbtraderumors.com/transactions/feed",
-        "priority": 2,
     },
 ]
 
@@ -165,14 +161,14 @@ def is_recent(dt):
 
 def dedupe_key(item):
 
-    raw = f"{item['source_key']}||{item['title']}||{item['summary']}"
+    raw = f"{item['source_key']}||{item['link']}"
 
     digest = hashlib.sha256(raw.encode()).hexdigest()
 
     return f"mlb-news:{digest}"
 
 
-def fetch_rss_feed(source):
+def fetch_feed(source):
 
     parsed = feedparser.parse(source["url"])
 
@@ -195,16 +191,10 @@ def fetch_rss_feed(source):
             "link": link,
             "source_name": source["name"],
             "source_key": source["key"],
-            "priority": source["priority"],
             "published": published,
         })
 
     return items
-
-
-def fetch_feed(source):
-
-    return fetch_rss_feed(source)
 
 
 def post_to_discord(item):
@@ -288,6 +278,10 @@ def main():
         except Exception as exc:
 
             print(f"{source['name']} failed: {exc}")
+
+    # 🔥 NEW: sort by publish time (oldest first)
+
+    raw_items.sort(key=lambda x: x["published"] or datetime.now(UTC))
 
     posted = 0
 
