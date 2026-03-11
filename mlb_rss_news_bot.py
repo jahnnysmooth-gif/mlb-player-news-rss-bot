@@ -10,7 +10,7 @@ import feedparser
 import requests
 import redis
 
-print("=== CLEAN ROTOWIRE + MLBTR VERSION ===")
+print("[BOT] === CLEAN ROTOWIRE + MLBTR VERSION ===")
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 REDIS_URL = os.getenv("REDIS_URL", "")
@@ -21,9 +21,9 @@ MAX_NEWS_AGE_HOURS = 24
 DEDUP_TTL_DAYS = 14
 
 TEAM_ABBR = [
-    "ARI","ATL","BAL","BOS","CHC","CWS","CIN","CLE","COL","DET",
-    "HOU","KC","LAA","LAD","MIA","MIL","MIN","NYM","NYY","OAK",
-    "PHI","PIT","SD","SF","SEA","STL","TB","TEX","TOR","WSH"
+    "ARI", "ATL", "BAL", "BOS", "CHC", "CWS", "CIN", "CLE", "COL", "DET",
+    "HOU", "KC", "LAA", "LAD", "MIA", "MIL", "MIN", "NYM", "NYY", "OAK",
+    "PHI", "PIT", "SD", "SF", "SEA", "STL", "TB", "TEX", "TOR", "WSH"
 ]
 
 FEEDS = [
@@ -56,68 +56,49 @@ def strip_html(text):
 
 
 def canonical_link(link):
-
     link = normalize(link)
-
     if not link:
         return ""
 
     parsed = urlparse(link)
     cleaned = parsed._replace(query="", fragment="")
-
     return urlunparse(cleaned)
 
 
 def truncate(text, limit):
-
     text = normalize(text)
-
     if len(text) <= limit:
         return text
-
     return text[:limit - 1].rstrip() + "…"
 
 
 def extract_player(text):
-
     pattern = r"\b([A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+(?:Jr\.|Sr\.|II|III))?)\b"
-
-    m = re.search(pattern, text)
-
+    m = re.search(pattern, text or "")
     if m:
         return m.group(1)
-
     return None
 
 
 def extract_team(text):
-
-    t = text.upper()
-
+    t = (text or "").upper()
     for abbr in TEAM_ABBR:
-
         if f" {abbr} " in f" {t} ":
             return abbr
-
     return None
 
 
 def classify_news(text):
+    t = (text or "").lower()
 
-    t = text.lower()
-
-    if "injur" in t or "il" in t:
+    if "injur" in t or " il " in f" {t} ":
         return "🚑", "Injury"
-
     if "lineup" in t or "scratched" in t:
         return "🔄", "Lineup"
-
     if "closer" in t:
         return "🔒", "Bullpen"
-
     if "called up" in t or "promoted" in t:
         return "⬆️", "Call-Up"
-
     if "traded" in t or "signed" in t or "dfa" in t:
         return "🚨", "Transaction"
 
@@ -125,7 +106,6 @@ def classify_news(text):
 
 
 def color_for_tag(tag):
-
     return {
         "Injury": 0xE74C3C,
         "Lineup": 0x3498DB,
@@ -137,7 +117,6 @@ def color_for_tag(tag):
 
 
 def parse_rss_date(entry):
-
     if hasattr(entry, "published_parsed") and entry.published_parsed:
         return datetime(*entry.published_parsed[:6], tzinfo=UTC)
 
@@ -148,30 +127,22 @@ def parse_rss_date(entry):
 
 
 def is_recent(dt):
-
     if not dt:
         return False
-
     return datetime.now(UTC) - dt < timedelta(hours=MAX_NEWS_AGE_HOURS)
 
 
 def dedupe_key(item):
-
     raw = f"{item['source_key']}||{item['link']}"
-
     digest = hashlib.sha256(raw.encode()).hexdigest()
-
     return f"mlb-news:{digest}"
 
 
 def fetch_feed(source):
-
     parsed = feedparser.parse(source["url"])
-
     items = []
 
     for entry in parsed.entries[:25]:
-
         published = parse_rss_date(entry)
 
         if not is_recent(published):
@@ -194,7 +165,6 @@ def fetch_feed(source):
 
 
 def post_to_discord(item):
-
     emoji, tag = classify_news(item["title"] + " " + item["summary"])
 
     player = extract_player(item["title"]) or extract_player(item["summary"])
@@ -208,7 +178,6 @@ def post_to_discord(item):
         header = f"{emoji} Player News"
 
     details = truncate(item["summary"], 420)
-
     if not details:
         details = "No additional details."
 
@@ -230,7 +199,6 @@ def post_to_discord(item):
     }
 
     for _ in range(5):
-
         r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=HTTP_TIMEOUT)
 
         if r.status_code < 300:
@@ -238,72 +206,58 @@ def post_to_discord(item):
             return
 
         if r.status_code == 429:
-
             retry = 5
-
             try:
                 retry = float(r.json().get("retry_after", 5))
             except Exception:
                 pass
 
-            print(f"Rate limited. Sleeping {retry}")
-
+            print(f"[BOT] Rate limited. Sleeping {retry}")
             time.sleep(retry + 0.5)
-
             continue
 
         r.raise_for_status()
 
 
 def main():
-
     rdb = get_redis()
-
     raw_items = []
 
     for source in FEEDS:
-
         try:
-
             items = fetch_feed(source)
-
             raw_items.extend(items)
-
-            print(f"{source['name']}: fetched {len(items)} items")
-
+            print(f"[BOT] {source['name']}: fetched {len(items)} items")
         except Exception as exc:
-
-            print(f"{source['name']} failed: {exc}")
+            print(f"[BOT] {source['name']} failed: {exc}")
 
     raw_items.sort(key=lambda x: x["published"] or datetime.now(UTC))
 
     posted = 0
 
     for item in raw_items:
-
         key = dedupe_key(item)
 
         if rdb.exists(key):
+            print(f"[BOT] Skipping duplicate: {item['title']}")
             continue
 
         try:
-
             post_to_discord(item)
 
             ttl = DEDUP_TTL_DAYS * 24 * 60 * 60
-
             rdb.setex(key, ttl, "1")
 
             posted += 1
+            print(f"[BOT] Posted: {item['title']}")
 
         except Exception as e:
-
-            print("Failed posting", item["title"], e)
+            print("[BOT] Failed posting", item["title"], e)
 
         if posted >= MAX_POSTS_PER_RUN:
             break
 
-    print("Posted", posted)
+    print("[BOT] Posted", posted)
 
 
 if __name__ == "__main__":
