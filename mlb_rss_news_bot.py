@@ -2,23 +2,25 @@ import os
 import re
 import time
 import html
+import json
 import hashlib
 import sqlite3
 from datetime import datetime, UTC
+from urllib.parse import urlparse, urlunparse
 
 import feedparser
 import requests
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 DB_FILE = os.getenv("DB_FILE", "mlb_rss_news.db")
-MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", "10"))
+MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", "3"))
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "20"))
 
 FEEDS = [
     {
         "name": "RotoWire",
         "key": "rotowire",
-        "url": "https://www.rotowire.com/rss/news/mlb.php",
+        "url": "https://www.rotowire.com/rss/news.php?sport=MLB",
         "priority": 1,
     },
     {
@@ -80,7 +82,6 @@ ARTICLE_PATTERNS = [
     r"\bpower ranking[s]?\b",
     r"\bnotes\b",
     r"\broundup\b",
-    r"\brecap\b",
     r"\bwhat we learned\b",
     r"\bhow to watch\b",
     r"\broster battle\b",
@@ -95,7 +96,7 @@ ARTICLE_PATTERNS = [
 TEAM_WORDS = {
     "diamondbacks", "braves", "orioles", "red sox", "cubs", "white sox", "reds",
     "guardians", "rockies", "tigers", "astros", "royals", "angels", "dodgers",
-    "marlins", "brewers", "twins", "mets", "yankees", "athletics", "as",
+    "marlins", "brewers", "twins", "mets", "yankees", "athletics", "a's",
     "phillies", "pirates", "padres", "giants", "mariners", "cardinals", "rays",
     "rangers", "blue jays", "nationals"
 }
@@ -186,24 +187,40 @@ def clean_title(title: str) -> str:
     return normalize_space(title)
 
 
+def canonicalize_link(link: str) -> str:
+    link = normalize_space(link)
+    if not link:
+        return ""
+    parsed = urlparse(link)
+    cleaned = parsed._replace(query="", fragment="")
+    return urlunparse(cleaned)
+
+
 def normalize_for_dedupe(text: str) -> str:
     text = clean_title(text).lower()
+
     replacements = {
         "injured list": "il",
         "10-day injured list": "10-day il",
         "15-day injured list": "15-day il",
         "60-day injured list": "60-day il",
         "designated for assignment": "dfa",
+        "reinstated from the injured list": "activated",
+        "activated from the injured list": "activated",
+        "called up from triple-a": "called up",
+        "recalled from triple-a": "recalled",
+        "selected from triple-a": "selected the contract",
     }
+
     for old, new in replacements.items():
         text = text.replace(old, new)
+
+    text = re.sub(r"\bthe\b", " ", text)
+    text = re.sub(r"\bto\b", " ", text)
+    text = re.sub(r"\bfrom\b", " ", text)
+    text = re.sub(r"\bof\b", " ", text)
     text = re.sub(r"[^a-z0-9\s-]", "", text)
     return normalize_space(text)
-
-
-def make_dedupe_key(player_name: str, title: str) -> str:
-    raw = f"{player_name.lower()}||{normalize_for_dedupe(title)}"
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def extract_player_name(text: str) -> str | None:
@@ -221,12 +238,67 @@ def extract_player_name(text: str) -> str | None:
     return None
 
 
+def summarize_event_text(text: str) -> str:
+    t = normalize_for_dedupe(text)
+
+    event_patterns = [
+        r"(placed on .*? il)",
+        r"(activated)",
+        r"(reinstated)",
+        r"(optioned)",
+        r"(recalled)",
+        r"(called up)",
+        r"(promoted)",
+        r"(selected the contract)",
+        r"(dfa)",
+        r"(released)",
+        r"(traded)",
+        r"(signed)",
+        r"(acquired)",
+        r"(scratched)",
+        r"(not in the lineup)",
+        r"(returns to the lineup)",
+        r"(batting leadoff)",
+        r"(batting second)",
+        r"(will start)",
+        r"(expected to start)",
+        r"(rehab assignment)",
+        r"(mri)",
+        r"(forearm)",
+        r"(elbow)",
+        r"(shoulder)",
+        r"(hamstring)",
+        r"(oblique)",
+        r"(back tightness)",
+        r"(closer)",
+        r"(save chance)",
+        r"(bullpen)",
+    ]
+
+    for pattern in event_patterns:
+        match = re.search(pattern, t)
+        if match:
+            return match.group(1)
+
+    return t
+
+
+def make_dedupe_key(player_name: str, title: str, summary: str, source_key: str) -> str:
+    if source_key == "mlbtr_transactions":
+        event_text = summarize_event_text(f"{title} {summary}")
+    else:
+        event_text = normalize_for_dedupe(title)
+
+    raw = f"{player_name.lower()}||{event_text}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def contains_player_news_keyword(text: str) -> bool:
     t = text.lower()
     return any(keyword in t for keyword in PLAYER_NEWS_KEYWORDS)
 
 
-def looks_like_article_or_team_news(title: str, summary: str) -> bool:
+def looks_like_article_or_team_news(title: str, summary: str, source_key: str) -> bool:
     combined = f"{title} {summary}".lower()
 
     for pattern in ARTICLE_PATTERNS:
@@ -235,7 +307,8 @@ def looks_like_article_or_team_news(title: str, summary: str) -> bool:
 
     has_team_word = any(team in combined for team in TEAM_WORDS)
     has_player = extract_player_name(title) or extract_player_name(summary)
-    if has_team_word and not has_player:
+
+    if source_key != "rotowire" and has_team_word and not has_player:
         return True
 
     return False
@@ -281,8 +354,11 @@ def fetch_feed(source: dict) -> list[dict]:
 
     for entry in parsed.entries[:25]:
         title = clean_title(getattr(entry, "title", ""))
-        link = normalize_space(getattr(entry, "link", ""))
+        link = canonicalize_link(getattr(entry, "link", ""))
         summary = strip_html(getattr(entry, "summary", ""))
+        published = normalize_space(
+            getattr(entry, "published", "") or getattr(entry, "updated", "")
+        )
 
         items.append(
             {
@@ -292,6 +368,7 @@ def fetch_feed(source: dict) -> list[dict]:
                 "title": title,
                 "link": link,
                 "summary": summary,
+                "published": published,
             }
         )
 
@@ -302,12 +379,41 @@ def is_valid_player_news_item(item: dict) -> tuple[bool, str | None]:
     title = item["title"]
     summary = item["summary"]
     combined = f"{title} {summary}"
+    source_key = item["source_key"]
 
-    if looks_like_article_or_team_news(title, summary):
+    if looks_like_article_or_team_news(title, summary, source_key):
         return False, None
 
     player_name = extract_player_name(title) or extract_player_name(summary)
     if not player_name:
+        return False, None
+
+    if source_key == "rotowire":
+        if len(summary) < 20:
+            return False, None
+
+        if contains_player_news_keyword(title) or contains_player_news_keyword(summary):
+            return True, player_name
+
+        summary_lower = summary.lower()
+        if any(
+            phrase in summary_lower
+            for phrase in [
+                "dealing with",
+                "expected back",
+                "remains out",
+                "could return",
+                "is out",
+                "was scratched",
+                "will open",
+                "will miss",
+                "is expected",
+                "is slated",
+                "will work",
+            ]
+        ):
+            return True, player_name
+
         return False, None
 
     if not contains_player_news_keyword(combined):
@@ -318,18 +424,29 @@ def is_valid_player_news_item(item: dict) -> tuple[bool, str | None]:
 
 def choose_best_items(items: list[dict]) -> list[dict]:
     chosen: dict[str, dict] = {}
+    seen_links: set[str] = set()
 
     for item in items:
         ok, player_name = is_valid_player_news_item(item)
         if not ok or not player_name:
             continue
 
+        if item["link"] and item["link"] in seen_links:
+            continue
+
         item["player_name"] = player_name
-        dedupe_key = make_dedupe_key(player_name, item["title"])
+        dedupe_key = make_dedupe_key(
+            player_name,
+            item["title"],
+            item["summary"],
+            item["source_key"],
+        )
         item["dedupe_key"] = dedupe_key
 
         if dedupe_key not in chosen:
             chosen[dedupe_key] = item
+            if item["link"]:
+                seen_links.add(item["link"])
             continue
 
         current = chosen[dedupe_key]
@@ -371,12 +488,42 @@ def post_to_discord(item: dict) -> None:
         "allowed_mentions": {"parse": []},
     }
 
-    response = requests.post(
-        DISCORD_WEBHOOK_URL,
-        json=payload,
-        timeout=HTTP_TIMEOUT,
-    )
-    response.raise_for_status()
+    max_attempts = 5
+
+    for attempt in range(max_attempts):
+        response = requests.post(
+            DISCORD_WEBHOOK_URL,
+            json=payload,
+            timeout=HTTP_TIMEOUT,
+        )
+
+        if response.status_code < 300:
+            time.sleep(1.5)
+            return
+
+        if response.status_code == 429:
+            retry_after = 5.0
+            try:
+                data = response.json()
+                retry_after = float(data.get("retry_after", retry_after))
+            except Exception:
+                pass
+
+            retry_header = response.headers.get("Retry-After")
+            if retry_header:
+                try:
+                    retry_after = max(retry_after, float(retry_header))
+                except Exception:
+                    pass
+
+            sleep_for = retry_after + 0.5
+            print(f"Discord rate limit hit. Sleeping {sleep_for:.2f} seconds...")
+            time.sleep(sleep_for)
+            continue
+
+        response.raise_for_status()
+
+    raise RuntimeError(f"Discord webhook failed after retries: {item['title']}")
 
 
 def main() -> None:
@@ -385,12 +532,20 @@ def main() -> None:
     raw_items: list[dict] = []
     for source in FEEDS:
         try:
-            raw_items.extend(fetch_feed(source))
+            feed_items = fetch_feed(source)
+            raw_items.extend(feed_items)
+            print(f"{source['name']}: fetched {len(feed_items)} items")
         except Exception as exc:
             print(f"Feed failed for {source['name']}: {exc}")
 
     final_items = choose_best_items(raw_items)
+
+    rotowire_count = sum(1 for item in final_items if item["source_key"] == "rotowire")
+    mlbtr_count = sum(1 for item in final_items if item["source_key"] == "mlbtr_transactions")
+
     print(f"Eligible player-news items found: {len(final_items)}")
+    print(f"RotoWire eligible items: {rotowire_count}")
+    print(f"MLBTR eligible items: {mlbtr_count}")
 
     posted = 0
     for item in final_items:
@@ -407,7 +562,6 @@ def main() -> None:
                 item["link"],
             )
             posted += 1
-            time.sleep(1)
         except Exception as exc:
             print(f"Failed posting {item['title']}: {exc}")
 

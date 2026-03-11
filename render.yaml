@@ -10,6 +10,6 @@ services:
       - key: DISCORD_WEBHOOK_URL
         sync: false
       - key: MAX_POSTS_PER_RUN
-        value: "10"
+        value: "3"
       - key: HTTP_TIMEOUT
         value: "20"
