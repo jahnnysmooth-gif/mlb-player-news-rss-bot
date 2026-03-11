@@ -14,7 +14,7 @@ from bs4 import BeautifulSoup
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 REDIS_URL = os.getenv("REDIS_URL", "")
-MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", "3"))
+MAX_POSTS_PER_RUN = 8
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "20"))
 MAX_NEWS_AGE_HOURS = int(os.getenv("MAX_NEWS_AGE_HOURS", "24"))
 DEDUP_TTL_DAYS = int(os.getenv("DEDUP_TTL_DAYS", "14"))
@@ -23,6 +23,12 @@ USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
 )
+
+TEAM_ABBR = [
+    "ARI","ATL","BAL","BOS","CHC","CWS","CIN","CLE","COL","DET",
+    "HOU","KC","LAA","LAD","MIA","MIL","MIN","NYM","NYY","OAK",
+    "PHI","PIT","SD","SF","SEA","STL","TB","TEX","TOR","WSH"
+]
 
 FEEDS = [
     {
@@ -48,122 +54,57 @@ FEEDS = [
     },
 ]
 
-ARTICLE_PATTERNS = [
-    r"\bpreview\b",
-    r"\branking\b",
-    r"\bdepth chart\b",
-    r"\broundup\b",
-    r"\bmailbag\b",
-    r"\bpodcast\b",
-]
 
-INJURY_WORDS = [
-    "injured", "injury", "il", "mri", "tightness", "soreness",
-    "forearm", "elbow", "shoulder", "hamstring", "oblique", "back"
-]
-LINEUP_WORDS = [
-    "lineup", "starting", "scratched", "batting", "leadoff", "cleanup"
-]
-CLOSER_WORDS = [
-    "closer", "save chance", "bullpen"
-]
-CALLUP_WORDS = [
-    "called up", "promoted", "recalled", "optioned"
-]
-TRANSACTION_WORDS = [
-    "traded", "signed", "dfa", "released", "activated", "reinstated", "acquired"
-]
-
-BLOCKED_NOISE_LINES = {
-    "menu",
-    "latest player updates",
-    "premium",
-    "more news",
-    "rankings",
-    "stats",
-}
-
-
-def get_redis():
-    if not REDIS_URL:
-        raise RuntimeError("REDIS_URL is not set")
-    return redis.from_url(REDIS_URL, decode_responses=True)
-
-
-def dedupe_exists(rdb, key: str) -> bool:
-    return bool(rdb.exists(key))
-
-
-def dedupe_mark(rdb, key: str) -> None:
-    ttl_seconds = DEDUP_TTL_DAYS * 24 * 60 * 60
-    rdb.setex(key, ttl_seconds, datetime.now(UTC).isoformat())
+def extract_team(text):
+    t = text.upper()
+    for abbr in TEAM_ABBR:
+        if f" {abbr} " in f" {t} ":
+            return abbr
+    return None
 
 
 def normalize(text):
     return re.sub(r"\s+", " ", text or "").strip()
 
 
-def clean_noise(text):
-    text = normalize(text)
-    if text.lower() in BLOCKED_NOISE_LINES:
-        return ""
-    return text
-
-
 def strip_html(text):
     text = html.unescape(text or "")
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
     text = re.sub(r"<[^>]+>", " ", text)
-    return clean_noise(text)
-
-
-def canonical_link(link):
-    link = normalize(link)
-    if not link:
-        return ""
-    parsed = urlparse(link)
-    cleaned = parsed._replace(query="", fragment="")
-    return urlunparse(cleaned)
-
-
-def truncate(text, limit):
-    text = normalize(text)
-    if len(text) <= limit:
-        return text
-    return text[: limit - 1].rstrip() + "…"
+    return normalize(text)
 
 
 def extract_player(text):
     text = normalize(text)
 
     patterns = [
-        r"\b([A-Z][a-z]+(?:[-'][A-Z]?[a-z]+)?\s+[A-Z][a-z]+(?:[-'][A-Z]?[a-z]+)?(?:\s+(?:Jr\.|Sr\.|II|III|IV))?)\b",
-        r"\b([A-Z][a-z]+(?:[-'][A-Z]?[a-z]+)?\s+[A-Z]\.\s+[A-Z][a-z]+(?:[-'][A-Z]?[a-z]+)?)\b",
+        r"\b([A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+(?:Jr\.|Sr\.|II|III))?)\b",
     ]
 
     for pattern in patterns:
         m = re.search(pattern, text)
         if m:
             return normalize(m.group(1))
+
     return None
 
 
 def classify_news(text):
     t = text.lower()
 
-    if any(w in t for w in INJURY_WORDS):
+    if "injur" in t or "il" in t:
         return "🚑", "Injury"
 
-    if any(w in t for w in LINEUP_WORDS):
+    if "lineup" in t or "scratched" in t:
         return "🔄", "Lineup"
 
-    if any(w in t for w in CLOSER_WORDS):
+    if "closer" in t or "save chance" in t:
         return "🔒", "Bullpen"
 
-    if any(w in t for w in CALLUP_WORDS):
+    if "called up" in t or "promoted" in t:
         return "⬆️", "Call-Up"
 
-    if any(w in t for w in TRANSACTION_WORDS):
+    if "traded" in t or "signed" in t or "dfa" in t:
         return "🚨", "Transaction"
 
     return "📰", "Player News"
@@ -183,139 +124,54 @@ def color_for_tag(tag):
 def parse_rss_date(entry):
     if hasattr(entry, "published_parsed") and entry.published_parsed:
         return datetime(*entry.published_parsed[:6], tzinfo=UTC)
+
     if hasattr(entry, "updated_parsed") and entry.updated_parsed:
         return datetime(*entry.updated_parsed[:6], tzinfo=UTC)
+
     return None
-
-
-def parse_fantasypros_date(text):
-    text = normalize(text)
-    if not text:
-        return None
-
-    match = re.match(
-        r"^(?P<dow>[A-Z][a-z]{2}),\s+(?P<mon>[A-Z][a-z]{2})\s+(?P<day>\d{1,2})(?:st|nd|rd|th)\s+(?P<time>\d{1,2}:\d{2}(?:am|pm))\s+(?P<tz>EDT|EST)$",
-        text,
-    )
-    if not match:
-        return None
-
-    now_et = datetime.now(ZoneInfo("America/New_York"))
-    year = now_et.year
-    rebuilt = f"{match.group('dow')}, {match.group('mon')} {match.group('day')} {year} {match.group('time')}"
-
-    try:
-        naive = datetime.strptime(rebuilt, "%a, %b %d %Y %I:%M%p")
-        dt_et = naive.replace(tzinfo=ZoneInfo("America/New_York"))
-        return dt_et.astimezone(UTC)
-    except Exception:
-        return None
 
 
 def is_recent(dt):
     if not dt:
         return False
+
     return datetime.now(UTC) - dt < timedelta(hours=MAX_NEWS_AGE_HOURS)
 
 
-def normalize_for_dedupe(text):
-    text = text.lower()
-    text = re.sub(r"injured list", "il", text)
-    text = re.sub(r"designated for assignment", "dfa", text)
-    text = re.sub(r"minor league deal", "minor league deal", text)
-    text = re.sub(r"re-signs", "signs", text)
-    text = re.sub(r"re-sign", "sign", text)
-    text = re.sub(r"outrights", "outright", text)
-    text = re.sub(r"selects", "selected", text)
-    text = re.sub(r"[^a-z0-9\s-]", "", text)
-    return normalize(text)
+def canonical_link(link):
+    link = normalize(link)
+
+    if not link:
+        return ""
+
+    parsed = urlparse(link)
+    cleaned = parsed._replace(query="", fragment="")
+
+    return urlunparse(cleaned)
 
 
-def summarize_event_text(text):
-    t = normalize_for_dedupe(text)
-
-    patterns = [
-        r"(placed on .*? il)",
-        r"(activated)",
-        r"(reinstated)",
-        r"(optioned)",
-        r"(recalled)",
-        r"(called up)",
-        r"(promoted)",
-        r"(dfa)",
-        r"(released)",
-        r"(traded)",
-        r"(signed)",
-        r"(acquired)",
-        r"(minor league deal)",
-        r"(extension)",
-        r"(outright)",
-        r"(scratched)",
-        r"(starting)",
-        r"(returns to the lineup)",
-        r"(batting leadoff)",
-        r"(batting second)",
-        r"(mri)",
-        r"(forearm)",
-        r"(elbow)",
-        r"(shoulder)",
-        r"(hamstring)",
-        r"(oblique)",
-        r"(closer)",
-        r"(save chance)",
-    ]
-
-    for pattern in patterns:
-        m = re.search(pattern, t)
-        if m:
-            return m.group(1)
-
-    return t
-
-
-def identity_dedupe_key(item):
-    link = canonical_link(item.get("link", ""))
-    if link:
-        raw = f"{item['source_key']}||link||{link}"
-    else:
-        published = item.get("published")
-        published_str = published.isoformat() if published else ""
-        raw = f"{item['source_key']}||{normalize_for_dedupe(item.get('title', ''))}||{normalize_for_dedupe(item.get('summary', ''))}||{published_str}"
-
+def dedupe_key(item):
+    raw = f"{item['source_key']}||{item['title']}||{item['summary']}"
     digest = hashlib.sha256(raw.encode()).hexdigest()
-    return f"mlb-news:item:{digest}"
 
-
-def cross_source_dedupe_key(player, item):
-    raw_event = summarize_event_text(item["title"] + " " + item["summary"])
-    raw = f"{player.lower()}||{raw_event}"
-    digest = hashlib.sha256(raw.encode()).hexdigest()
-    return f"mlb-news:event:{digest}"
-
-
-def looks_like_article(title, summary):
-    combined = f"{title} {summary}".lower()
-    for pattern in ARTICLE_PATTERNS:
-        if re.search(pattern, combined, flags=re.I):
-            return True
-    return False
+    return f"mlb-news:{digest}"
 
 
 def fetch_rss_feed(source):
     parsed = feedparser.parse(source["url"])
+
     items = []
 
     for entry in parsed.entries[:25]:
+
         published = parse_rss_date(entry)
+
         if not is_recent(published):
             continue
 
-        title = clean_noise(getattr(entry, "title", ""))
+        title = normalize(getattr(entry, "title", ""))
         summary = strip_html(getattr(entry, "summary", ""))
         link = canonical_link(getattr(entry, "link", ""))
-
-        if not title:
-            continue
 
         items.append({
             "title": title,
@@ -331,233 +187,136 @@ def fetch_rss_feed(source):
 
 
 def fetch_fantasypros_feed(source):
+
     response = requests.get(
         source["url"],
         timeout=HTTP_TIMEOUT,
         headers={"User-Agent": USER_AGENT},
     )
-    response.raise_for_status()
 
     soup = BeautifulSoup(response.text, "html.parser")
 
-    title_to_link = {}
-    for a in soup.find_all("a", href=True):
-        txt = clean_noise(a.get_text(" ", strip=True))
-        if txt:
-            title_to_link[txt] = urljoin(source["url"], a["href"])
-
     page_text = soup.get_text("\n")
-    start_marker = "Latest Player Updates"
-    start_idx = page_text.find(start_marker)
-    if start_idx == -1:
-        return []
-
-    page_text = page_text[start_idx:]
-    raw_lines = [clean_noise(x) for x in page_text.splitlines()]
-    lines = [x for x in raw_lines if x]
 
     items = []
-    date_re = re.compile(r"^[A-Z][a-z]{2},\s+[A-Z][a-z]{2}\s+\d{1,2}(?:st|nd|rd|th)\s+\d{1,2}:\d{2}(?:am|pm)\s+(?:EDT|EST)$")
 
-    for i, line in enumerate(lines):
-        if not date_re.match(line):
-            continue
+    for block in page_text.split("\n\n"):
 
-        if i < 1:
-            continue
+        title = normalize(block.split("\n")[0])
 
-        title = lines[i - 1]
         if not title:
             continue
 
-        published = parse_fantasypros_date(line)
-        if not is_recent(published):
-            continue
-
-        source_blurb = ""
-        fantasy_impact = ""
-
-        if i + 1 < len(lines) and lines[i + 1].startswith("By "):
-            if i + 2 < len(lines):
-                source_blurb = lines[i + 2]
-
-        for j in range(i + 2, min(i + 10, len(lines))):
-            if lines[j].startswith("Fantasy Impact:"):
-                fantasy_impact = lines[j].replace("Fantasy Impact:", "", 1).strip()
-                break
-            if lines[j].startswith("Category:"):
-                break
-
-        summary_parts = []
-        if source_blurb:
-            summary_parts.append(source_blurb)
-        if fantasy_impact:
-            summary_parts.append(f"Fantasy Impact: {fantasy_impact}")
-
-        summary = normalize(" ".join(summary_parts))
-        link = canonical_link(title_to_link.get(title, source["url"]))
+        summary = normalize(block)
 
         items.append({
             "title": title,
             "summary": summary,
-            "link": link,
+            "link": source["url"],
             "source_name": source["name"],
             "source_key": source["key"],
             "priority": source["priority"],
-            "published": published,
+            "published": datetime.now(UTC),
         })
 
     return items
 
 
 def fetch_feed(source):
+
     if source["type"] == "rss":
         return fetch_rss_feed(source)
+
     if source["type"] == "html":
         return fetch_fantasypros_feed(source)
+
     return []
 
 
-def is_valid_item(item):
-    title = item["title"]
-    summary = item["summary"]
-    source_key = item["source_key"]
-
-    # RotoWire: no restrictions
-    if source_key == "rotowire":
-        item["player"] = extract_player(title) or extract_player(summary)
-        return True
-
-    if looks_like_article(title, summary):
-        return False
-
-    player = extract_player(title) or extract_player(summary)
-    if not player:
-        return False
-
-    item["player"] = player
-
-    if source_key == "fantasypros":
-        return True
-
-    return True
-
-
-def choose_items(raw_items):
-    chosen = {}
-
-    for item in raw_items:
-        if not is_valid_item(item):
-            continue
-
-        identity_key = identity_dedupe_key(item)
-        player = item.get("player")
-
-        # Cross-source dedupe only when we have a player.
-        # Otherwise fall back to exact-item dedupe only.
-        dedupe_key = cross_source_dedupe_key(player, item) if player else identity_key
-
-        item["identity_key"] = identity_key
-        item["dedupe_key"] = dedupe_key
-
-        if dedupe_key not in chosen or item["priority"] < chosen[dedupe_key]["priority"]:
-            chosen[dedupe_key] = item
-
-    final_items = list(chosen.values())
-    final_items.sort(key=lambda x: (x["priority"], x["title"].lower()))
-    return final_items
-
-
 def post_to_discord(item):
+
     emoji, tag = classify_news(item["title"] + " " + item["summary"])
 
-    details = truncate(item["summary"], 420)
-    if not details:
-        details = "No additional details."
+    player = extract_player(item["title"]) or extract_player(item["summary"])
+    team = extract_team(item["title"] + " " + item["summary"])
 
-    player_name = item.get("player") or item["source_name"]
+    if player and team:
+        header = f"{emoji} {player} ({team})"
+    elif player:
+        header = f"{emoji} {player}"
+    else:
+        header = f"{emoji} Player News"
+
+    details = item["summary"][:420]
 
     payload = {
         "embeds": [
             {
-                "title": f"{emoji} {truncate(player_name, 180)}",
+                "title": header,
                 "url": item["link"],
-                "description": f"**Headline:** {truncate(item['title'], 220)}\n\n**Details:** {details}",
+                "description": details,
                 "color": color_for_tag(tag),
                 "fields": [
                     {"name": "Tag", "value": tag, "inline": True},
                     {"name": "Source", "value": item["source_name"], "inline": True},
                 ],
-                "footer": {"text": "RSS player news"},
+                "footer": {"text": "MLB Player News Bot"},
                 "timestamp": datetime.now(UTC).isoformat(),
             }
-        ],
+        ]
     }
 
-    for _ in range(5):
-        r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=HTTP_TIMEOUT)
+    r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=HTTP_TIMEOUT)
 
-        if r.status_code < 300:
-            time.sleep(1.5)
-            return
-
-        if r.status_code == 429:
-            retry = 5
-            try:
-                retry = float(r.json().get("retry_after", 5))
-            except Exception:
-                pass
-            print(f"Rate limited. Sleeping {retry}")
-            time.sleep(retry + 0.5)
-            continue
-
+    if r.status_code >= 300:
         r.raise_for_status()
+
+    time.sleep(1.5)
+
+
+def get_redis():
+    return redis.from_url(REDIS_URL, decode_responses=True)
 
 
 def main():
-    if not DISCORD_WEBHOOK_URL:
-        raise RuntimeError("DISCORD_WEBHOOK_URL is not set")
 
     rdb = get_redis()
+
     raw_items = []
 
     for source in FEEDS:
+
         try:
             items = fetch_feed(source)
+
             raw_items.extend(items)
+
             print(f"{source['name']}: fetched {len(items)} items")
+
         except Exception as exc:
             print(f"{source['name']} failed: {exc}")
 
-    valid = choose_items(raw_items)
-
-    rotowire_count = sum(1 for x in valid if x["source_key"] == "rotowire")
-    fantasypros_count = sum(1 for x in valid if x["source_key"] == "fantasypros")
-    mlbtr_count = sum(1 for x in valid if x["source_key"] == "mlbtr_transactions")
-
-    print(f"Eligible player-news items found: {len(valid)}")
-    print(f"RotoWire eligible items: {rotowire_count}")
-    print(f"FantasyPros eligible items: {fantasypros_count}")
-    print(f"MLBTR eligible items: {mlbtr_count}")
-
     posted = 0
 
-    for item in valid:
-        dedupe_keys_to_check = [item["identity_key"]]
-        if item["dedupe_key"] != item["identity_key"]:
-            dedupe_keys_to_check.append(item["dedupe_key"])
+    for item in raw_items:
 
-        if any(dedupe_exists(rdb, key) for key in dedupe_keys_to_check):
+        key = dedupe_key(item)
+
+        if rdb.exists(key):
             continue
 
         try:
+
             post_to_discord(item)
 
-            for key in dedupe_keys_to_check:
-                dedupe_mark(rdb, key)
+            ttl = DEDUP_TTL_DAYS * 24 * 60 * 60
+
+            rdb.setex(key, ttl, "1")
 
             posted += 1
+
         except Exception as e:
+
             print("Failed posting", item["title"], e)
 
         if posted >= MAX_POSTS_PER_RUN:
