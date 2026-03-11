@@ -25,10 +25,16 @@ FEEDS = [
         "priority": 1,
     },
     {
+        "name": "FantasyPros",
+        "key": "fantasypros",
+        "url": "https://www.fantasypros.com/mlb/player-news.php?format=rss",
+        "priority": 2,
+    },
+    {
         "name": "MLB Trade Rumors Transactions",
         "key": "mlbtr_transactions",
         "url": "https://www.mlbtraderumors.com/transactions/feed",
-        "priority": 2,
+        "priority": 3,
     },
 ]
 
@@ -71,11 +77,22 @@ ARTICLE_PATTERNS = [
     r"\bpodcast\b",
 ]
 
-INJURY_WORDS = ["injured", "injury", "il", "mri", "tightness", "soreness", "forearm", "elbow", "shoulder", "hamstring", "oblique", "back"]
-LINEUP_WORDS = ["lineup", "starting", "scratched", "batting", "leadoff", "cleanup"]
-CLOSER_WORDS = ["closer", "save chance", "bullpen"]
-CALLUP_WORDS = ["called up", "promoted", "recalled", "optioned"]
-TRANSACTION_WORDS = ["traded", "signed", "dfa", "released", "activated", "reinstated", "acquired"]
+INJURY_WORDS = [
+    "injured", "injury", "il", "mri", "tightness", "soreness",
+    "forearm", "elbow", "shoulder", "hamstring", "oblique", "back"
+]
+LINEUP_WORDS = [
+    "lineup", "starting", "scratched", "batting", "leadoff", "cleanup"
+]
+CLOSER_WORDS = [
+    "closer", "save chance", "bullpen"
+]
+CALLUP_WORDS = [
+    "called up", "promoted", "recalled", "optioned"
+]
+TRANSACTION_WORDS = [
+    "traded", "signed", "dfa", "released", "activated", "reinstated", "acquired"
+]
 
 TEAM_WORDS = {
     "diamondbacks", "braves", "orioles", "red sox", "cubs", "white sox", "reds",
@@ -160,6 +177,17 @@ def classify_news(text):
         return "🚨", "Transaction"
 
     return "📰", "Player News"
+
+
+def color_for_tag(tag):
+    return {
+        "Injury": 0xE74C3C,
+        "Lineup": 0x3498DB,
+        "Bullpen": 0x9B59B6,
+        "Call-Up": 0x2ECC71,
+        "Transaction": 0xF39C12,
+        "Player News": 0x95A5A6,
+    }.get(tag, 0x95A5A6)
 
 
 def parse_date(entry):
@@ -299,6 +327,11 @@ def is_valid_item(item):
 
         return True, player
 
+    if source_key == "fantasypros":
+        if len(summary) < 25:
+            return False, None
+        return True, player
+
     combined = f"{title} {summary}"
     if not contains_keyword(combined):
         return False, None
@@ -346,7 +379,7 @@ def post_to_discord(item):
                 "title": f"{emoji} {item['player']}",
                 "url": item["link"],
                 "description": description,
-                "color": 3447003,
+                "color": color_for_tag(tag),
                 "fields": [
                     {"name": "Tag", "value": tag, "inline": True},
                     {"name": "Source", "value": item["source_name"], "inline": True},
@@ -392,10 +425,12 @@ def main():
     valid = choose_items(raw_items)
 
     rotowire_count = sum(1 for x in valid if x["source_key"] == "rotowire")
+    fantasypros_count = sum(1 for x in valid if x["source_key"] == "fantasypros")
     mlbtr_count = sum(1 for x in valid if x["source_key"] == "mlbtr_transactions")
 
     print(f"Eligible player-news items found: {len(valid)}")
     print(f"RotoWire eligible items: {rotowire_count}")
+    print(f"FantasyPros eligible items: {fantasypros_count}")
     print(f"MLBTR eligible items: {mlbtr_count}")
 
     posted = 0
