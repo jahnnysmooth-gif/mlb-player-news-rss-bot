@@ -10,17 +10,15 @@ import feedparser
 import requests
 import redis
 
+print("=== CLEAN ROTOWIRE + MLBTR VERSION ===")
+
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 REDIS_URL = os.getenv("REDIS_URL", "")
-MAX_POSTS_PER_RUN = 4
-HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "20"))
-MAX_NEWS_AGE_HOURS = int(os.getenv("MAX_NEWS_AGE_HOURS", "24"))
-DEDUP_TTL_DAYS = int(os.getenv("DEDUP_TTL_DAYS", "14"))
 
-USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
-)
+MAX_POSTS_PER_RUN = 4
+HTTP_TIMEOUT = 20
+MAX_NEWS_AGE_HOURS = 24
+DEDUP_TTL_DAYS = 14
 
 TEAM_ABBR = [
     "ARI","ATL","BAL","BOS","CHC","CWS","CIN","CLE","COL","DET",
@@ -77,19 +75,17 @@ def truncate(text, limit):
     if len(text) <= limit:
         return text
 
-    return text[: limit - 1].rstrip() + "…"
+    return text[:limit - 1].rstrip() + "…"
 
 
 def extract_player(text):
-
-    text = normalize(text)
 
     pattern = r"\b([A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+(?:Jr\.|Sr\.|II|III))?)\b"
 
     m = re.search(pattern, text)
 
     if m:
-        return normalize(m.group(1))
+        return m.group(1)
 
     return None
 
@@ -116,7 +112,7 @@ def classify_news(text):
     if "lineup" in t or "scratched" in t:
         return "🔄", "Lineup"
 
-    if "closer" in t or "save chance" in t:
+    if "closer" in t:
         return "🔒", "Bullpen"
 
     if "called up" in t or "promoted" in t:
@@ -278,8 +274,6 @@ def main():
         except Exception as exc:
 
             print(f"{source['name']} failed: {exc}")
-
-    # 🔥 NEW: sort by publish time (oldest first)
 
     raw_items.sort(key=lambda x: x["published"] or datetime.now(UTC))
 
