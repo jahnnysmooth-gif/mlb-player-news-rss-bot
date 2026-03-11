@@ -273,11 +273,24 @@ def summarize_event_text(text):
     return t
 
 
-def dedupe_key(player, item):
+def identity_dedupe_key(item):
+    link = canonical_link(item.get("link", ""))
+    if link:
+        raw = f"{item['source_key']}||link||{link}"
+    else:
+        published = item.get("published")
+        published_str = published.isoformat() if published else ""
+        raw = f"{item['source_key']}||{normalize_for_dedupe(item.get('title', ''))}||{normalize_for_dedupe(item.get('summary', ''))}||{published_str}"
+
+    digest = hashlib.sha256(raw.encode()).hexdigest()
+    return f"mlb-news:item:{digest}"
+
+
+def cross_source_dedupe_key(player, item):
     raw_event = summarize_event_text(item["title"] + " " + item["summary"])
     raw = f"{player.lower()}||{raw_event}"
     digest = hashlib.sha256(raw.encode()).hexdigest()
-    return f"mlb-news:{digest}"
+    return f"mlb-news:event:{digest}"
 
 
 def looks_like_article(title, summary):
@@ -410,41 +423,45 @@ def is_valid_item(item):
     summary = item["summary"]
     source_key = item["source_key"]
 
+    # RotoWire: no restrictions
+    if source_key == "rotowire":
+        item["player"] = extract_player(title) or extract_player(summary)
+        return True
+
     if looks_like_article(title, summary):
-        return False, None
+        return False
 
     player = extract_player(title) or extract_player(summary)
     if not player:
-        return False, None
+        return False
 
-    if source_key == "rotowire":
-        # Very loose now
-        if len(title) < 8:
-            return False, None
-        return True, player
+    item["player"] = player
 
     if source_key == "fantasypros":
-        # Very loose now
-        return True, player
+        return True
 
-    # MLBTR still slightly stricter
-    return True, player
+    return True
 
 
 def choose_items(raw_items):
     chosen = {}
 
     for item in raw_items:
-        ok, player = is_valid_item(item)
-        if not ok:
+        if not is_valid_item(item):
             continue
 
-        item["player"] = player
-        key = dedupe_key(player, item)
-        item["dedupe_key"] = key
+        identity_key = identity_dedupe_key(item)
+        player = item.get("player")
 
-        if key not in chosen or item["priority"] < chosen[key]["priority"]:
-            chosen[key] = item
+        # Cross-source dedupe only when we have a player.
+        # Otherwise fall back to exact-item dedupe only.
+        dedupe_key = cross_source_dedupe_key(player, item) if player else identity_key
+
+        item["identity_key"] = identity_key
+        item["dedupe_key"] = dedupe_key
+
+        if dedupe_key not in chosen or item["priority"] < chosen[dedupe_key]["priority"]:
+            chosen[dedupe_key] = item
 
     final_items = list(chosen.values())
     final_items.sort(key=lambda x: (x["priority"], x["title"].lower()))
@@ -454,15 +471,16 @@ def choose_items(raw_items):
 def post_to_discord(item):
     emoji, tag = classify_news(item["title"] + " " + item["summary"])
 
-    # More consistent embed size
     details = truncate(item["summary"], 420)
     if not details:
         details = "No additional details."
 
+    player_name = item.get("player") or item["source_name"]
+
     payload = {
         "embeds": [
             {
-                "title": f"{emoji} {item['player']}",
+                "title": f"{emoji} {truncate(player_name, 180)}",
                 "url": item["link"],
                 "description": f"**Headline:** {truncate(item['title'], 220)}\n\n**Details:** {details}",
                 "color": color_for_tag(tag),
@@ -525,14 +543,19 @@ def main():
     posted = 0
 
     for item in valid:
-        key = item["dedupe_key"]
+        dedupe_keys_to_check = [item["identity_key"]]
+        if item["dedupe_key"] != item["identity_key"]:
+            dedupe_keys_to_check.append(item["dedupe_key"])
 
-        if dedupe_exists(rdb, key):
+        if any(dedupe_exists(rdb, key) for key in dedupe_keys_to_check):
             continue
 
         try:
             post_to_discord(item)
-            dedupe_mark(rdb, key)
+
+            for key in dedupe_keys_to_check:
+                dedupe_mark(rdb, key)
+
             posted += 1
         except Exception as e:
             print("Failed posting", item["title"], e)
