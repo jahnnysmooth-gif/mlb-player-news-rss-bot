@@ -48,37 +48,6 @@ FEEDS = [
     },
 ]
 
-PLAYER_NEWS_KEYWORDS = [
-    "placed on",
-    "il",
-    "day-to-day",
-    "scratched",
-    "starting",
-    "returns to the lineup",
-    "batting",
-    "rehab assignment",
-    "mri",
-    "forearm",
-    "elbow",
-    "shoulder",
-    "hamstring",
-    "oblique",
-    "activated",
-    "reinstated",
-    "optioned",
-    "recalled",
-    "called up",
-    "promoted",
-    "dfa",
-    "released",
-    "traded",
-    "signed",
-    "acquired",
-    "closer",
-    "save chance",
-    "bullpen",
-]
-
 ARTICLE_PATTERNS = [
     r"\bpreview\b",
     r"\branking\b",
@@ -105,6 +74,15 @@ TRANSACTION_WORDS = [
     "traded", "signed", "dfa", "released", "activated", "reinstated", "acquired"
 ]
 
+BLOCKED_NOISE_LINES = {
+    "menu",
+    "latest player updates",
+    "premium",
+    "more news",
+    "rankings",
+    "stats",
+}
+
 
 def get_redis():
     if not REDIS_URL:
@@ -125,11 +103,18 @@ def normalize(text):
     return re.sub(r"\s+", " ", text or "").strip()
 
 
+def clean_noise(text):
+    text = normalize(text)
+    if text.lower() in BLOCKED_NOISE_LINES:
+        return ""
+    return text
+
+
 def strip_html(text):
     text = html.unescape(text or "")
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
     text = re.sub(r"<[^>]+>", " ", text)
-    return normalize(text)
+    return clean_noise(text)
 
 
 def canonical_link(link):
@@ -139,6 +124,13 @@ def canonical_link(link):
     parsed = urlparse(link)
     cleaned = parsed._replace(query="", fragment="")
     return urlunparse(cleaned)
+
+
+def truncate(text, limit):
+    text = normalize(text)
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
 
 
 def extract_player(text):
@@ -154,11 +146,6 @@ def extract_player(text):
         if m:
             return normalize(m.group(1))
     return None
-
-
-def contains_keyword(text):
-    t = text.lower()
-    return any(k in t for k in PLAYER_NEWS_KEYWORDS)
 
 
 def classify_news(text):
@@ -202,7 +189,6 @@ def parse_rss_date(entry):
 
 
 def parse_fantasypros_date(text):
-    # Example: Wed, Mar 11th 1:01pm EDT
     text = normalize(text)
     if not text:
         return None
@@ -216,8 +202,8 @@ def parse_fantasypros_date(text):
 
     now_et = datetime.now(ZoneInfo("America/New_York"))
     year = now_et.year
-
     rebuilt = f"{match.group('dow')}, {match.group('mon')} {match.group('day')} {year} {match.group('time')}"
+
     try:
         naive = datetime.strptime(rebuilt, "%a, %b %d %Y %I:%M%p")
         dt_et = naive.replace(tzinfo=ZoneInfo("America/New_York"))
@@ -236,6 +222,11 @@ def normalize_for_dedupe(text):
     text = text.lower()
     text = re.sub(r"injured list", "il", text)
     text = re.sub(r"designated for assignment", "dfa", text)
+    text = re.sub(r"minor league deal", "minor league deal", text)
+    text = re.sub(r"re-signs", "signs", text)
+    text = re.sub(r"re-sign", "sign", text)
+    text = re.sub(r"outrights", "outright", text)
+    text = re.sub(r"selects", "selected", text)
     text = re.sub(r"[^a-z0-9\s-]", "", text)
     return normalize(text)
 
@@ -256,6 +247,9 @@ def summarize_event_text(text):
         r"(traded)",
         r"(signed)",
         r"(acquired)",
+        r"(minor league deal)",
+        r"(extension)",
+        r"(outright)",
         r"(scratched)",
         r"(starting)",
         r"(returns to the lineup)",
@@ -280,11 +274,7 @@ def summarize_event_text(text):
 
 
 def dedupe_key(player, item):
-    if item["source_key"] == "mlbtr_transactions":
-        raw_event = summarize_event_text(item["title"] + " " + item["summary"])
-    else:
-        raw_event = normalize_for_dedupe(item["title"])
-
+    raw_event = summarize_event_text(item["title"] + " " + item["summary"])
     raw = f"{player.lower()}||{raw_event}"
     digest = hashlib.sha256(raw.encode()).hexdigest()
     return f"mlb-news:{digest}"
@@ -307,9 +297,12 @@ def fetch_rss_feed(source):
         if not is_recent(published):
             continue
 
-        title = normalize(getattr(entry, "title", ""))
+        title = clean_noise(getattr(entry, "title", ""))
         summary = strip_html(getattr(entry, "summary", ""))
         link = canonical_link(getattr(entry, "link", ""))
+
+        if not title:
+            continue
 
         items.append({
             "title": title,
@@ -336,24 +329,18 @@ def fetch_fantasypros_feed(source):
 
     title_to_link = {}
     for a in soup.find_all("a", href=True):
-        txt = normalize(a.get_text(" ", strip=True))
+        txt = clean_noise(a.get_text(" ", strip=True))
         if txt:
             title_to_link[txt] = urljoin(source["url"], a["href"])
 
     page_text = soup.get_text("\n")
     start_marker = "Latest Player Updates"
-    end_marker = "Premium"
-
     start_idx = page_text.find(start_marker)
     if start_idx == -1:
         return []
 
     page_text = page_text[start_idx:]
-    end_idx = page_text.find(end_marker)
-    if end_idx != -1:
-        page_text = page_text[:end_idx]
-
-    raw_lines = [normalize(x) for x in page_text.splitlines()]
+    raw_lines = [clean_noise(x) for x in page_text.splitlines()]
     lines = [x for x in raw_lines if x]
 
     items = []
@@ -367,7 +354,7 @@ def fetch_fantasypros_feed(source):
             continue
 
         title = lines[i - 1]
-        if title in {"» Rankings", "» Stats", "» More News", "Latest Player Updates", "Menu"}:
+        if not title:
             continue
 
         published = parse_fantasypros_date(line)
@@ -381,7 +368,7 @@ def fetch_fantasypros_feed(source):
             if i + 2 < len(lines):
                 source_blurb = lines[i + 2]
 
-        for j in range(i + 2, min(i + 9, len(lines))):
+        for j in range(i + 2, min(i + 10, len(lines))):
             if lines[j].startswith("Fantasy Impact:"):
                 fantasy_impact = lines[j].replace("Fantasy Impact:", "", 1).strip()
                 break
@@ -393,8 +380,8 @@ def fetch_fantasypros_feed(source):
             summary_parts.append(source_blurb)
         if fantasy_impact:
             summary_parts.append(f"Fantasy Impact: {fantasy_impact}")
-        summary = normalize(" ".join(summary_parts))
 
+        summary = normalize(" ".join(summary_parts))
         link = canonical_link(title_to_link.get(title, source["url"]))
 
         items.append({
@@ -431,51 +418,25 @@ def is_valid_item(item):
         return False, None
 
     if source_key == "rotowire":
-        if len(summary) < 25:
+        # Very loose now
+        if len(title) < 8:
             return False, None
-
-        summary_lower = summary.lower()
-        blocked_rotowire_patterns = [
-            "top ",
-            "rankings",
-            "depth chart",
-            "spring training battle",
-            "opening day roster",
-            "podcast",
-            "mailbag",
-        ]
-        if any(p in summary_lower for p in blocked_rotowire_patterns):
-            return False, None
-
         return True, player
 
     if source_key == "fantasypros":
-        # Much looser now: if there is a player name and either a summary
-        # or a news-like title, let it through.
-        combined = f"{title} {summary}"
-        if len(summary) >= 10:
-            return True, player
-        if contains_keyword(combined):
-            return True, player
+        # Very loose now
         return True, player
 
-    combined = f"{title} {summary}"
-    if not contains_keyword(combined):
-        return False, None
-
+    # MLBTR still slightly stricter
     return True, player
 
 
 def choose_items(raw_items):
     chosen = {}
-    seen_links = set()
 
     for item in raw_items:
         ok, player = is_valid_item(item)
         if not ok:
-            continue
-
-        if item["link"] and item["link"] in seen_links:
             continue
 
         item["player"] = player
@@ -485,9 +446,6 @@ def choose_items(raw_items):
         if key not in chosen or item["priority"] < chosen[key]["priority"]:
             chosen[key] = item
 
-        if item["link"]:
-            seen_links.add(item["link"])
-
     final_items = list(chosen.values())
     final_items.sort(key=lambda x: (x["priority"], x["title"].lower()))
     return final_items
@@ -496,16 +454,17 @@ def choose_items(raw_items):
 def post_to_discord(item):
     emoji, tag = classify_news(item["title"] + " " + item["summary"])
 
-    description = f"**{item['title']}**"
-    if item["summary"] and item["summary"].lower() != item["title"].lower():
-        description += f"\n\n{item['summary'][:1000]}"
+    # More consistent embed size
+    details = truncate(item["summary"], 420)
+    if not details:
+        details = "No additional details."
 
     payload = {
         "embeds": [
             {
                 "title": f"{emoji} {item['player']}",
                 "url": item["link"],
-                "description": description,
+                "description": f"**Headline:** {truncate(item['title'], 220)}\n\n**Details:** {details}",
                 "color": color_for_tag(tag),
                 "fields": [
                     {"name": "Tag", "value": tag, "inline": True},
