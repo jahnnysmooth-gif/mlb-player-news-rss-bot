@@ -1,21 +1,21 @@
-
 import os
 import re
 import time
 import html
 import hashlib
-import sqlite3
 from datetime import datetime, UTC, timedelta
 from urllib.parse import urlparse, urlunparse
 
 import feedparser
 import requests
+import redis
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
-DB_FILE = os.getenv("DB_FILE", "mlb_rss_news.db")
+REDIS_URL = os.getenv("REDIS_URL", "")
 MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", "3"))
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "20"))
-MAX_NEWS_AGE_HOURS = 24
+MAX_NEWS_AGE_HOURS = int(os.getenv("MAX_NEWS_AGE_HOURS", "24"))
+DEDUP_TTL_DAYS = int(os.getenv("DEDUP_TTL_DAYS", "14"))
 
 FEEDS = [
     {
@@ -86,29 +86,19 @@ TEAM_WORDS = {
 }
 
 
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS posted_items (
-            dedupe_key TEXT PRIMARY KEY,
-            posted_at TEXT
-        )
-    """)
-    conn.commit()
-    return conn
+def get_redis():
+    if not REDIS_URL:
+        raise RuntimeError("REDIS_URL is not set")
+    return redis.from_url(REDIS_URL, decode_responses=True)
 
 
-def was_posted(conn, key):
-    r = conn.execute("SELECT 1 FROM posted_items WHERE dedupe_key = ?", (key,))
-    return r.fetchone() is not None
+def dedupe_exists(rdb, key: str) -> bool:
+    return bool(rdb.exists(key))
 
 
-def mark_posted(conn, key):
-    conn.execute(
-        "INSERT OR REPLACE INTO posted_items VALUES (?, ?)",
-        (key, datetime.now(UTC).isoformat()),
-    )
-    conn.commit()
+def dedupe_mark(rdb, key: str) -> None:
+    ttl_seconds = DEDUP_TTL_DAYS * 24 * 60 * 60
+    rdb.setex(key, ttl_seconds, datetime.now(UTC).isoformat())
 
 
 def normalize(text):
@@ -240,7 +230,8 @@ def dedupe_key(player, item):
         raw_event = normalize_for_dedupe(item["title"])
 
     raw = f"{player.lower()}||{raw_event}"
-    return hashlib.sha256(raw.encode()).hexdigest()
+    digest = hashlib.sha256(raw.encode()).hexdigest()
+    return f"mlb-news:{digest}"
 
 
 def looks_like_article(title, summary):
@@ -290,13 +281,10 @@ def is_valid_item(item):
         return False, None
 
     if source_key == "rotowire":
-        # Much looser rules for RotoWire:
-        # if it has a player name and meaningful summary, let it through.
         if len(summary) < 25:
             return False, None
 
         summary_lower = summary.lower()
-
         blocked_rotowire_patterns = [
             "top ",
             "rankings",
@@ -306,19 +294,12 @@ def is_valid_item(item):
             "podcast",
             "mailbag",
         ]
-
         if any(p in summary_lower for p in blocked_rotowire_patterns):
             return False, None
 
         return True, player
 
-    # MLBTR stays stricter
     combined = f"{title} {summary}"
-
-    has_team_only = any(team in combined.lower() for team in TEAM_WORDS) and not player
-    if has_team_only:
-        return False, None
-
     if not contains_keyword(combined):
         return False, None
 
@@ -360,7 +341,6 @@ def post_to_discord(item):
         description += f"\n\n{item['summary'][:1000]}"
 
     payload = {
-        "username": "MLB Player News",
         "embeds": [
             {
                 "title": f"{emoji} {item['player']}",
@@ -398,8 +378,10 @@ def post_to_discord(item):
 
 
 def main():
-    conn = init_db()
+    if not DISCORD_WEBHOOK_URL:
+        raise RuntimeError("DISCORD_WEBHOOK_URL is not set")
 
+    rdb = get_redis()
     raw_items = []
 
     for source in FEEDS:
@@ -421,12 +403,12 @@ def main():
     for item in valid:
         key = item["dedupe_key"]
 
-        if was_posted(conn, key):
+        if dedupe_exists(rdb, key):
             continue
 
         try:
             post_to_discord(item)
-            mark_posted(conn, key)
+            dedupe_mark(rdb, key)
             posted += 1
         except Exception as e:
             print("Failed posting", item["title"], e)

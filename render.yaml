@@ -9,7 +9,13 @@ services:
     envVars:
       - key: DISCORD_WEBHOOK_URL
         sync: false
+      - key: REDIS_URL
+        sync: false
       - key: MAX_POSTS_PER_RUN
         value: "3"
       - key: HTTP_TIMEOUT
         value: "20"
+      - key: MAX_NEWS_AGE_HOURS
+        value: "24"
+      - key: DEDUP_TTL_DAYS
+        value: "14"
