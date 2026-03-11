@@ -20,6 +20,11 @@ HTTP_TIMEOUT = 20
 MAX_NEWS_AGE_HOURS = 24
 DEDUP_TTL_DAYS = 14
 
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+)
+
 TEAM_ABBR = [
     "ARI", "ATL", "BAL", "BOS", "CHC", "CWS", "CIN", "CLE", "COL", "DET",
     "HOU", "KC", "LAA", "LAD", "MIA", "MIL", "MIN", "NYM", "NYY", "OAK",
@@ -33,9 +38,9 @@ FEEDS = [
         "url": "https://www.rotowire.com/rss/news.php?sport=MLB",
     },
     {
-        "name": "MLB Trade Rumors Transactions",
+        "name": "MLB Trade Rumors",
         "key": "mlbtr",
-        "url": "https://www.mlbtraderumors.com/transactions/feed",
+        "url": "http://feeds.feedburner.com/MlbTradeRumors",
     },
 ]
 
@@ -73,7 +78,7 @@ def truncate(text, limit):
 
 
 def extract_player(text):
-    pattern = r"\b([A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+(?:Jr\.|Sr\.|II|III))?)\b"
+    pattern = r"\b([A-Z][a-z]+(?:[-'][A-Z]?[a-z]+)?\s+[A-Z][a-z]+(?:[-'][A-Z]?[a-z]+)?(?:\s+(?:Jr\.|Sr\.|II|III|IV))?)\b"
     m = re.search(pattern, text or "")
     if m:
         return m.group(1)
@@ -91,15 +96,15 @@ def extract_team(text):
 def classify_news(text):
     t = (text or "").lower()
 
-    if "injur" in t or " il " in f" {t} ":
+    if "injur" in t or " il " in f" {t} " or "mri" in t or "soreness" in t:
         return "🚑", "Injury"
-    if "lineup" in t or "scratched" in t:
+    if "lineup" in t or "scratched" in t or "batting" in t or "starting" in t:
         return "🔄", "Lineup"
-    if "closer" in t:
+    if "closer" in t or "save chance" in t or "bullpen" in t:
         return "🔒", "Bullpen"
-    if "called up" in t or "promoted" in t:
+    if "called up" in t or "promoted" in t or "recalled" in t:
         return "⬆️", "Call-Up"
-    if "traded" in t or "signed" in t or "dfa" in t:
+    if "traded" in t or "signed" in t or "dfa" in t or "released" in t or "acquired" in t:
         return "🚨", "Transaction"
 
     return "📰", "Player News"
@@ -139,8 +144,10 @@ def dedupe_key(item):
 
 
 def fetch_feed(source):
-    parsed = feedparser.parse(source["url"])
+    parsed = feedparser.parse(source["url"], agent=USER_AGENT)
     items = []
+
+    print(f"[BOT] {source['name']} raw parsed entries: {len(parsed.entries)}")
 
     for entry in parsed.entries[:25]:
         published = parse_rss_date(entry)
@@ -151,6 +158,9 @@ def fetch_feed(source):
         title = normalize(getattr(entry, "title", ""))
         summary = strip_html(getattr(entry, "summary", ""))
         link = canonical_link(getattr(entry, "link", ""))
+
+        if not title:
+            continue
 
         items.append({
             "title": title,
@@ -220,6 +230,11 @@ def post_to_discord(item):
 
 
 def main():
+    if not DISCORD_WEBHOOK_URL:
+        raise RuntimeError("DISCORD_WEBHOOK_URL is not set")
+    if not REDIS_URL:
+        raise RuntimeError("REDIS_URL is not set")
+
     rdb = get_redis()
     raw_items = []
 
